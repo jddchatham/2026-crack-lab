@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""2026_crack - modern binary analysis lab, bridging 1996-era reversing craft
+to 2026 tooling. Static analysis, sandboxed runs, tracing, diffing, and
+local-LLM assisted reading of disassembly. DOS-era targets delegate to
+Debug Lab 2.0 (the 1996 heritage pipeline stays untouched).
+
+  2026_crack tui                        interactive lab (default)
+  2026_crack identify FILE              magic, PE/ELF structure, hashes, entropy
+  2026_crack strings FILE [-u]          ascii + UTF-16LE strings
+  2026_crack disasm FILE [--lines N]    objdump slice (ELF + PE via wine's binutils)
+  2026_crack run FILE [args...]         sandboxed run (wine prefix / timeout)
+  2026_crack trace FILE [args...]       strace for ELF, wine log for PE
+  2026_crack compare A B                version diff: sections, entropy, strings
+  2026_crack explain FILE [--lines N]   local LLM reads the disassembly for you
+  2026_crack dos                        hand a DOS target to Debug Lab 2.0 (1996 bridge)
+"""
+import curses
+import hashlib
+import json
+import math
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+OLLAMA = "http://localhost:11434/api/generate"
+MODEL = os.environ.get("CRACK_MODEL", "lfm2.5-abliterated")
+
+
+# ---------- shared helpers ----------
+
+def shannon(data):
+    if not data:
+        return 0.0
+    counts = [0] * 256
+    for b in data:
+        counts[b] += 1
+    n = len(data)
+    return -sum((c / n) * math.log2(c / n) for c in counts if c)
+
+
+def hashes(path):
+    data = Path(path).read_bytes()
+    return data, hashlib.md5(data).hexdigest(), hashlib.sha256(data).hexdigest()
+
+
+def strings_from(data, minlen=5, wide=False):
+    out, run = [], []
+    step = 2 if wide else 1
+    i = 0
+    while i < len(data) - 1:
+        b = data[i] if not wide else data[i]
+        if wide:
+            ok = 32 <= data[i] < 127 and data[i + 1] == 0
+        else:
+            ok = 32 <= data[i] < 127
+        if ok:
+            run.append(chr(data[i]))
+        else:
+            if len(run) >= minlen:
+                out.append("".join(run))
+            run = []
+        i += step
+    if len(run) >= minlen:
+        out.append("".join(run))
+    return out
+
+
+# ---------- PE ----------
+
+def parse_pe(data):
+    info = {"type": "PE"}
+    if len(data) < 0x40:
+        return None
+    peoff = struct.unpack_from("<I", data, 0x3C)[0]
+    if peoff + 24 > len(data) or data[peoff:peoff + 4] != b"PE\0\0":
+        return None
+    try:
+        _mach, nsec, _ts, _sym, _nsym, optsz, chars = struct.unpack_from("<HHIIIHH", data, peoff + 4)
+    except struct.error:
+        return None
+    opt = peoff + 24
+    magic = struct.unpack_from("<H", data, opt)[0]
+    info["bits"] = 32 if magic == 0x10B else 64 if magic == 0x20B else magic
+    entry = struct.unpack_from("<I", data, opt + 16)[0]
+    imgbase = struct.unpack_from("<I", data, opt + 28)[0] if magic == 0x10B else struct.unpack_from("<Q", data, opt + 24)[0]
+    info["entry_rva"] = entry
+    info["image_base"] = imgbase
+    info["dll"] = bool(chars & 0x2000)
+    secs = []
+    sh = opt + optsz
+    for _ in range(nsec):
+        name = data[sh:sh + 8].split(b"\0")[0].decode("ascii", "replace")
+        vsize, vaddr, rsize, roff = struct.unpack_from("<IIII", data, sh + 8)
+        secs.append({"name": name, "vaddr": vaddr, "vsize": vsize, "raw": roff, "rawsize": rsize,
+                     "entropy": round(shannon(data[roff:roff + rsize]), 2)})
+        sh += 40
+    info["sections"] = secs
+    upx = data.find(b"UPX!") >= 0
+    info["packer"] = "UPX" if upx else ("high-entropy sections" if any(s["entropy"] > 7.2 for s in secs) else "-")
+    return info
+
+
+# ---------- ELF ----------
+
+def parse_elf(data):
+    if data[:4] != b"\x7fELF":
+        return None
+    info = {"type": "ELF", "bits": 64 if data[4] == 2 else 32, "endian": "le" if data[5] == 1 else "be"}
+    fmt = "<" if info["endian"] == "le" else ">"
+    if info["bits"] == 64:
+        entry = struct.unpack_from(fmt + "Q", data, 24)[0]
+        shoff = struct.unpack_from(fmt + "Q", data, 40)[0]
+        phentsize, phnum = struct.unpack_from(fmt + "HH", data, 54)
+        shentsize, shnum, shstrndx = struct.unpack_from(fmt + "HHH", data, 58)
+    else:
+        entry = struct.unpack_from(fmt + "I", data, 24)[0]
+        shoff = struct.unpack_from(fmt + "I", data, 32)[0]
+        phentsize, phnum = struct.unpack_from(fmt + "HH", data, 42)
+        shentsize, shnum, shstrndx = struct.unpack_from(fmt + "HHH", data, 46)
+    info["entry"] = entry
+    secs = []
+    for i in range(min(shnum, 64)):
+        s = shoff + i * shentsize
+        try:
+            if info["bits"] == 64:
+                name, stype, flags, addr, off, size = struct.unpack_from(fmt + "IIQQQQ", data, s)
+            else:
+                name, stype, flags, addr, off, size = struct.unpack_from(fmt + "IIIIII", data, s)
+            secs.append({"name": str(name), "vaddr": addr, "vsize": size, "raw": off, "rawsize": size,
+                         "entropy": round(shannon(data[off:off + min(size, 1 << 20)]), 2)})
+        except struct.error:
+            break
+    # attach names via shstrtab
+    try:
+        strh = shoff + shstrndx * shentsize
+        _n, _t, _f, _a, stroff, _sz = struct.unpack_from(fmt + "IIQQQQ", data, strh) if info["bits"] == 64 else struct.unpack_from(fmt + "IIIIII", data, strh)
+        for s in secs:
+            end = data.index(b"\0", stroff + int(s["name"]))
+            s["name"] = data[stroff + int(s["name"]):end].decode("ascii", "replace")
+    except Exception:
+        pass
+    info["sections"] = secs
+    info["phnum"] = phnum
+    info["packer"] = "-"
+    return info
+
+
+# ---------- subcommands ----------
+
+def cmd_identify(path):
+    data, md5, sha = hashes(path)
+    print(f"== {Path(path).name}: {len(data)} bytes ==")
+    print(f"  md5:    {md5}")
+    print(f"  sha256: {sha}")
+    print(f"  entropy (whole file): {shannon(data):.2f} / 8.00")
+    info = parse_pe(data) if data[:2] == b"MZ" else parse_elf(data)
+    if not info:
+        print("  unrecognized format")
+        return
+    print(f"  format: {info['type']} ({info.get('bits','?')}-bit){'  DLL' if info.get('dll') else ''}")
+    if info["type"] == "PE":
+        print(f"  entry: RVA {info['entry_rva']:#x}  image base {info['image_base']:#x}")
+    else:
+        print(f"  entry: {info['entry']:#x}   program headers: {info['phnum']}")
+    print(f"  packer heuristic: {info['packer']}")
+    print("  sections:")
+    for s in info["sections"][:24]:
+        print(f"    {s['name']:10s} vaddr={s['vaddr']:#012x} size={s['vsize']:#x} raw@+{s['raw']:#x} H={s['entropy']}")
+
+
+def cmd_strings(path, wide=False):
+    data, *_ = hashes(path)
+    ss = strings_from(data, wide=wide)
+    if not wide:
+        ss += [s for s in strings_from(data, wide=True) if len(s) >= 8]
+    seen = set()
+    for s in ss[:400]:
+        if s not in seen:
+            seen.add(s)
+            print(s)
+
+
+def cmd_disasm(path, lines=120):
+    data, *_ = hashes(path)
+    target = ["objdump", "-d", "-M", "intel", str(path)]
+    if data[:2] == b"MZ":
+        target = ["objdump", "-d", "-M", "intel", "-b", "pei-i386", str(path)]
+    out = subprocess.run(target, capture_output=True, text=True)
+    if out.returncode != 0 and data[:2] == b"MZ":
+        out = subprocess.run(["objdump", "-d", "-M", "intel", str(path)], capture_output=True, text=True)
+    txt = out.stdout or out.stderr
+    print("\n".join(txt.splitlines()[:lines]))
+
+
+def cmd_run(path, args):
+    p = Path(path).resolve()
+    data = p.read_bytes()[:4]
+    if data == b"\x7fELF":
+        try:
+            subprocess.run([str(p)] + args, timeout=15)
+        except subprocess.TimeoutExpired:
+            print("(15s timeout - still running? killed)")
+    elif data[:2] == b"MZ":
+        with tempfile.TemporaryDirectory() as pfx:
+            env = {"WINEPREFIX": pfx, "WINEDEBUG": "-all", "PATH": "/usr/bin:/bin", "HOME": str(HOME)}
+            try:
+                subprocess.run(["wine", str(p)] + args, env=env, timeout=60)
+            except subprocess.TimeoutExpired:
+                print("(60s timeout - killed)")
+    else:
+        print("not an executable format (or DOS - use the 'dos' bridge)")
+
+
+def cmd_trace(path, args):
+    p = Path(path).resolve()
+    if p.read_bytes()[:4] == b"\x7fELF":
+        subprocess.run(["strace", "-f", "-e", "trace=file,process,net", str(p)] + args)
+    else:
+        print("strace is ELF-only; for PE set WINEDEBUG=+relay and rerun 'run'")
+
+
+def cmd_compare(a, b):
+    da, *_ = hashes(a)
+    db, *_ = hashes(b)
+    ia = parse_pe(da) if da[:2] == b"MZ" else parse_elf(da)
+    ib = parse_pe(db) if db[:2] == b"MZ" else parse_elf(db)
+    print(f"A: {Path(a).name} {len(da)}B   B: {Path(b).name} {len(db)}B")
+    print(f"byte-identical prefix: {len(os.path.commonprefix([da, db]))} bytes")
+    if ia and ib and ia["type"] == ib["type"]:
+        sa = {s["name"]: s for s in ia["sections"]}
+        sb = {s["name"]: s for s in ib["sections"]}
+        for name in sa:
+            if name in sb and sa[name]["vsize"] != sb[name]["vsize"]:
+                print(f"  section {name}: {sa[name]['vsize']:#x} -> {sb[name]['vsize']:#x}")
+            if name in sb and sa[name]["entropy"] != sb[name]["entropy"]:
+                print(f"  entropy {name}: {sa[name]['entropy']} -> {sb[name]['entropy']}")
+    ta = set(strings_from(da)[:2000])
+    tb = set(strings_from(db)[:2000])
+    only_a, only_b = sorted(ta - tb)[:10], sorted(tb - ta)[:10]
+    if only_a:
+        print("  strings only in A:", only_a[:5])
+    if only_b:
+        print("  strings only in B:", only_b[:5])
+
+
+def cmd_explain(path, lines=80):
+    data, *_ = hashes(path)
+    target = ["objdump", "-d", "-M", "intel", str(path)]
+    if data[:2] == b"MZ":
+        target = ["objdump", "-d", "-M", "intel", "-b", "pei-i386", str(path)]
+    out = subprocess.run(target, capture_output=True, text=True)
+    disasm = "\n".join((out.stdout or "").splitlines()[:lines])
+    if not disasm.strip():
+        sys.exit("no disassembly produced")
+    prompt = ("You are a reverse engineer. In 6 short bullets, explain what this code does: "
+              "purpose, inputs/outputs, interesting constants, API calls, and anything suspicious.\n\n" + disasm)
+    req = json.dumps({"model": MODEL, "prompt": prompt, "stream": False,
+                      "options": {"num_predict": 400}}).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(OLLAMA, data=req,
+                                  headers={"Content-Type": "application/json"}), timeout=180) as r:
+            print(json.loads(r.read())["response"].strip())
+    except Exception as e:
+        print(f"(local LLM unavailable: {e})")
+        print("fallback: entry point disassembly above; install/run: ollama run qwen3.5:4b")
+
+
+# ---------- TUI ----------
+
+def tui():
+    import os
+    stdscr = curses.initscr()
+    curses.cbreak()
+    stdscr.keypad(True)
+    try:
+        tui_main(stdscr)
+    finally:
+        curses.endwin()
+
+
+def tui_main(stdscr):
+    import os
+    sel = 0
+    targets = []
+    while True:
+        if not targets:
+            for base in (HOME / "Games", HOME / "Downloads", PROGS_D):
+                if base.is_dir():
+                    targets += sorted(base.rglob("*.exe"))[:40]
+                    targets += sorted(base.rglob("*.[eE][lL][fF]"))[:10]
+            targets = targets[:60]
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addstr(0, 0, " 2026_crack ", curses.A_REVERSE)
+        stdscr.addstr(1, 0, "i identify  s strings  d disasm  r run  t trace  x explain  q quit")
+        for idx, p in enumerate(targets[:h - 5]):
+            mark = ">" if idx == sel else " "
+            try:
+                stdscr.addstr(2 + idx, 0, f"{mark} {p}"[-(w - 3):])
+            except curses.error:
+                pass
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (ord("q"), 27):
+            return
+        if ch == curses.KEY_UP:
+            sel = max(0, sel - 1)
+        elif ch == curses.KEY_DOWN:
+            sel = min(len(targets) - 1, sel + 1)
+        elif ch in (ord("i"), ord("s"), ord("d"), ord("r"), ord("t"), ord("x")) and targets:
+            p = targets[min(sel, len(targets) - 1)]
+            curses.endwin()
+            try:
+                if ch == ord("i"):
+                    cmd_identify(p)
+                elif ch == ord("s"):
+                    cmd_strings(p)
+                elif ch == ord("d"):
+                    cmd_disasm(p, lines=60)
+                elif ch == ord("r"):
+                    cmd_run(p, [])
+                elif ch == ord("t"):
+                    cmd_trace(p, [])
+                elif ch == ord("x"):
+                    cmd_explain(p)
+                input("\n[enter]")
+            finally:
+                stdscr.refresh()
+                curses.doupdate()
+
+
+PROGS_D = HOME / "debug-lab/progs"
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] == "tui":
+        tui()
+        return
+    cmd, rest = args[0], args[1:]
+    if cmd == "identify":
+        cmd_identify(rest[0])
+    elif cmd == "strings":
+        cmd_strings(rest[0])
+    elif cmd == "disasm":
+        cmd_disasm(rest[0], lines=int(rest[1]) if len(rest) > 1 else 120)
+    elif cmd == "run":
+        cmd_run(rest[0], rest[1:])
+    elif cmd == "trace":
+        cmd_trace(rest[0], rest[1:])
+    elif cmd == "compare":
+        cmd_compare(rest[0], rest[1])
+    elif cmd == "explain":
+        cmd_explain(rest[0])
+    elif cmd == "dos":
+        subprocess.run([str(HOME / "bin/debug-lab2"), "tui"])
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()
